@@ -196,7 +196,7 @@ async def invoke_function(
     job = Job(
         function_id=fn.id,
         consumer_id=current_user.id,
-        status="pending",
+        status="dispatched",
         input_args=body.args,
         credits_charged=fn.price_per_call,
         platform_fee=platform_fee,
@@ -204,8 +204,12 @@ async def invoke_function(
         node_payout=node_payout,
     )
     db.add(job)
-    await db.flush()
+
+    # COMMIT so the node's POST /results can see the job in its own session
+    await db.commit()
     await db.refresh(job)
+    await db.refresh(fn)
+    await db.refresh(current_user)
 
     # Publish to Redis Stream
     await redis_queue.publish_job({
@@ -217,10 +221,6 @@ async def invoke_function(
         "consumer_id": str(current_user.id),
     })
 
-    # Update job status to dispatched
-    job.status = "dispatched"
-    await db.flush()
-
     # Wait for result from node (30s timeout)
     result_data = await redis_queue.wait_for_result(str(job.id), timeout=30.0)
 
@@ -229,7 +229,7 @@ async def invoke_function(
         current_user.credits += fn.price_per_call
         job.status = "timeout"
         job.error_message = "Execution timed out after 30 seconds"
-        await db.flush()
+        await db.commit()
         return InvokeResponse(
             job_id=str(job.id),
             status="timeout",
@@ -256,7 +256,7 @@ async def invoke_function(
         job.error_message = result_data.get("error_message", "Unknown error")
         job.finished_at = datetime.now(timezone.utc)
 
-    await db.flush()
+    await db.commit()
 
     return InvokeResponse(
         job_id=str(job.id),

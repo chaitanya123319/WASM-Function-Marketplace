@@ -1,7 +1,7 @@
 """
-PinataService — All Pinata IPFS API calls.
+PinataService — All Pinata IPFS API calls (V3 Files API).
 
-Replaces S3 entirely. Every WASM binary is stored on IPFS via Pinata.
+Every WASM binary is stored on IPFS via Pinata.
 Retrieval URL: https://gateway.pinata.cloud/ipfs/<CID>
 Auth: Bearer <PINATA_JWT>
 """
@@ -15,8 +15,9 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-PINATA_PIN_URL = "https://api.pinata.cloud/pinning/pinFileToIPFS"
-PINATA_UNPIN_URL = "https://api.pinata.cloud/pinning/unpin/{cid}"
+# ── V3 API endpoints ─────────────────────────────────────────────────────────
+PINATA_UPLOAD_URL = "https://uploads.pinata.cloud/v3/files"
+PINATA_FILES_URL = "https://api.pinata.cloud/v3/files"
 PINATA_TEST_URL = "https://api.pinata.cloud/data/testAuthentication"
 
 
@@ -35,45 +36,46 @@ class PinataService:
         metadata: dict | None = None,
     ) -> dict:
         """
-        POST https://api.pinata.cloud/pinning/pinFileToIPFS
-        Returns: { cid, gateway_url, size, name }
+        POST https://uploads.pinata.cloud/v3/files
+        V3 Files API — replaces legacy pinFileToIPFS.
+        Returns: { cid, gateway_url, size, name, pinata_id }
         """
-        pinata_metadata = {
-            "name": function_name,
-            "keyvalues": {
-                "function_name": function_name,
-                "developer_id": str(developer_id),
-                **(metadata or {}),
-            },
+        keyvalues = {
+            "function_name": function_name,
+            "developer_id": str(developer_id),
+            **(metadata or {}),
         }
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
-                PINATA_PIN_URL,
+                PINATA_UPLOAD_URL,
                 headers=self.headers,
                 files={
                     "file": (f"{function_name}.wasm", io.BytesIO(file_bytes), "application/wasm"),
                 },
                 data={
-                    "pinataMetadata": json.dumps(pinata_metadata),
-                    "pinataOptions": json.dumps({"cidVersion": 1}),
+                    "network": "public",
+                    "name": function_name,
+                    "keyvalues": json.dumps(keyvalues),
                 },
             )
 
-        if response.status_code != 200:
+        if response.status_code not in (200, 201):
             logger.error("Pinata upload failed: %s — %s", response.status_code, response.text)
             raise RuntimeError(f"Pinata upload failed: {response.status_code} — {response.text}")
 
-        data = response.json()
-        cid = data["IpfsHash"]
+        data = response.json()["data"]
+        cid = data["cid"]
+        pinata_id = data["id"]
         gateway_url = f"{self.gateway}/ipfs/{cid}"
 
-        logger.info("Uploaded %s to IPFS: %s", function_name, cid)
+        logger.info("Uploaded %s to IPFS: CID=%s, ID=%s", function_name, cid, pinata_id)
         return {
             "cid": cid,
             "gateway_url": gateway_url,
-            "size": data.get("PinSize", len(file_bytes)),
+            "size": data.get("size", len(file_bytes)),
             "name": function_name,
+            "pinata_id": pinata_id,
         }
 
     # ── 2. Download WASM binary ───────────────────────────────────────────────
@@ -91,22 +93,47 @@ class PinataService:
 
         return response.content
 
-    # ── 3. Unpin WASM binary ──────────────────────────────────────────────────
+    # ── 3. Delete / Unpin WASM binary ─────────────────────────────────────────
     async def unpin_wasm(self, cid: str) -> bool:
         """
-        DELETE https://api.pinata.cloud/pinning/unpin/<cid>
+        DELETE https://api.pinata.cloud/v3/files/public/<id>
+        Note: V3 requires the Pinata file ID, not the CID.
+        Falls back to listing files by CID to find the ID first.
         Returns: True if successful
         """
-        url = PINATA_UNPIN_URL.format(cid=cid)
+        # First, find the Pinata file ID by CID
+        pinata_id = await self._get_file_id_by_cid(cid)
+        if not pinata_id:
+            logger.warning("Could not find Pinata file ID for CID %s — skipping unpin", cid)
+            return False
+
+        url = f"{PINATA_FILES_URL}/public/{pinata_id}"
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.delete(url, headers=self.headers)
 
-        if response.status_code == 200:
-            logger.info("Unpinned CID %s from Pinata", cid)
+        if response.status_code in (200, 204):
+            logger.info("Deleted file %s (CID %s) from Pinata", pinata_id, cid)
             return True
 
-        logger.warning("Unpin CID %s returned %s: %s", cid, response.status_code, response.text)
+        logger.warning("Delete file %s (CID %s) returned %s: %s",
+                        pinata_id, cid, response.status_code, response.text)
         return False
+
+    async def _get_file_id_by_cid(self, cid: str) -> str | None:
+        """Look up the Pinata file ID for a given CID via the list endpoint."""
+        url = f"{PINATA_FILES_URL}/public?cid={cid}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, headers=self.headers)
+
+        if response.status_code != 200:
+            logger.warning("Failed to list files for CID %s: %s", cid, response.text)
+            return None
+
+        data = response.json().get("data", {})
+        files = data.get("files", [])
+        if files:
+            return files[0]["id"]
+        return None
 
     # ── 4. Test Pinata connection ─────────────────────────────────────────────
     async def test_connection(self) -> bool:

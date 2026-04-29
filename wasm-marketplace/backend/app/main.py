@@ -25,11 +25,14 @@ async def lifespan(app: FastAPI):
     logger.info("Database tables ready.")
 
     logger.info("Testing Pinata connection...")
-    ok = await pinata.test_connection()
-    if ok:
-        logger.info("✅ Pinata connected successfully")
-    else:
-        logger.warning("⚠️  Pinata connection test failed — check PINATA_JWT in .env")
+    try:
+        ok = await pinata.test_connection()
+        if ok:
+            logger.info("✅ Pinata connected successfully")
+        else:
+            logger.warning("⚠️  Pinata connection test failed — check PINATA_JWT in .env")
+    except Exception as exc:
+        logger.warning("⚠️  Pinata connection test error (non-fatal): %s", exc)
 
     yield
 
