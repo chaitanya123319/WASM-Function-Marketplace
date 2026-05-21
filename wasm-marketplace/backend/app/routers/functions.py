@@ -244,7 +244,7 @@ async def invoke_function(
         fn.total_calls += 1
         fn.total_earnings += developer_payout
         job.status = "completed"
-        job.output_result = result_data.get("output_result", "")
+        job.output_result = str(result_data.get("output_result", ""))
         job.execution_signature = result_data.get("signature", "")
         job.execution_time_ms = float(result_data.get("execution_time_ms", 0))
         job.node_id = result_data.get("node_id", "")
